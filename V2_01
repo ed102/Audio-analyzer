@@ -1,0 +1,211 @@
+import sys
+import os
+import numpy as np
+import librosa
+import librosa.display
+from PyQt5 import QtCore, QtGui, QtWidgets
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+
+# Define supported audio file extensions.
+SUPPORTED_EXTENSIONS = ('.mp3', '.wav', '.flac', '.alac', '.aiff', '.aif')
+
+# Threshold for high frequency energy ratio.
+HIGH_FREQ_THRESHOLD = 0.01  # This can be tweaked based on your listening tests
+
+def analyze_audio(file_path):
+    """
+    Loads an audio file, computes its spectrogram, and determines whether it has significant
+    high-frequency energy (above 16 kHz).
+
+    Returns:
+        quality_flag (bool): True if file is considered high quality.
+        fig (matplotlib.figure.Figure): Figure object with the spectrogram.
+        details (dict): Dictionary containing computed energy ratios and other details.
+    """
+    try:
+        # Load the audio file with its native sample rate.
+        y, sr = librosa.load(file_path, sr=None, mono=True)
+    except Exception as e:
+        raise Exception(f"Error loading {file_path}: {e}")
+
+    # Compute short-time Fourier transform (STFT)
+    D = np.abs(librosa.stft(y))
+    freqs = librosa.fft_frequencies(sr=sr)
+
+    # Find indices of frequencies above 16 kHz.
+    high_freq_idx = np.where(freqs >= 16000)[0]
+    if len(high_freq_idx) == 0:
+        high_energy_ratio = 0.0
+    else:
+        high_energy = np.sum(D[high_freq_idx, :])
+        total_energy = np.sum(D)
+        high_energy_ratio = high_energy / total_energy if total_energy > 0 else 0.0
+
+    quality_flag = high_energy_ratio >= HIGH_FREQ_THRESHOLD
+
+    # Create a matplotlib figure for the spectrogram.
+    fig = Figure(figsize=(5, 3))
+    ax = fig.add_subplot(111)
+    img = librosa.display.specshow(librosa.amplitude_to_db(D, ref=np.max),
+                                   sr=sr, x_axis='time', y_axis='log', ax=ax,
+                                   cmap='viridis')
+    fig.colorbar(img, ax=ax, format="%+2.0f dB")
+    ax.set_title(os.path.basename(file_path))
+
+    details = {
+        'sample_rate': sr,
+        'high_energy_ratio': high_energy_ratio,
+        'threshold': HIGH_FREQ_THRESHOLD
+    }
+    return quality_flag, fig, details
+
+class SpectrogramTab(QtWidgets.QWidget):
+    """
+    Widget to display the spectrogram and quality information for a single audio file.
+    """
+    def __init__(self, file_path, quality_flag, figure, details, parent=None):
+        super().__init__(parent)
+        self.file_path = file_path
+        layout = QtWidgets.QVBoxLayout(self)
+
+        self.canvas = FigureCanvas(figure)
+        layout.addWidget(self.canvas)
+
+        quality_text = "High Quality" if quality_flag else "Low Quality"
+        quality_label = QtWidgets.QLabel(
+            f"Quality: {quality_text}\nHigh Freq Energy Ratio: {details['high_energy_ratio']:.3f}")
+        quality_label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(quality_label)
+
+class FolderWorker(QtCore.QObject):
+    """
+    Worker object that processes a list of files in a separate thread.
+    Emits a signal with the results for each file.
+    """
+    fileProcessed = QtCore.pyqtSignal(str, bool, object, dict)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(self, file_list):
+        super().__init__()
+        self.file_list = file_list
+
+    def process_files(self):
+        for file_path in self.file_list:
+            try:
+                quality_flag, figure, details = analyze_audio(file_path)
+                self.fileProcessed.emit(file_path, quality_flag, figure, details)
+            except Exception as e:
+                print(f"Error processing {file_path}: {e}")
+        self.finished.emit()
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("DJ Audio Quality Analyzer")
+        self.resize(800, 600)
+        central_widget = QtWidgets.QWidget(self)
+        self.setCentralWidget(central_widget)
+
+        main_layout = QtWidgets.QVBoxLayout(central_widget)
+
+        # Buttons for loading file and folder.
+        button_layout = QtWidgets.QHBoxLayout()
+        self.load_file_btn = QtWidgets.QPushButton("Load File")
+        self.load_folder_btn = QtWidgets.QPushButton("Load Folder")
+        button_layout.addWidget(self.load_file_btn)
+        button_layout.addWidget(self.load_folder_btn)
+        main_layout.addLayout(button_layout)
+
+        # Tab widget for displaying files.
+        self.tab_widget = QtWidgets.QTabWidget()
+        # Enable closable tabs.
+        self.tab_widget.setTabsClosable(True)
+        self.tab_widget.tabCloseRequested.connect(self.close_tab)
+        main_layout.addWidget(self.tab_widget)
+
+        # Connect signals.
+        self.load_file_btn.clicked.connect(self.load_file)
+        self.load_folder_btn.clicked.connect(self.load_folder)
+
+        # Enable drag & drop.
+        self.setAcceptDrops(True)
+
+        # For threading
+        self.folder_thread = None
+
+    def load_file(self):
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select Audio File", "", 
+            "Audio Files (*.mp3 *.wav *.flac *.alac *.aiff *.aif)")
+        if file_path:
+            self.add_file_tab(file_path)
+
+    def load_folder(self):
+        folder_path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Folder")
+        if folder_path:
+            file_list = []
+            for file in os.listdir(folder_path):
+                if file.lower().endswith(SUPPORTED_EXTENSIONS):
+                    file_list.append(os.path.join(folder_path, file))
+            if file_list:
+                # Create a worker and thread to process files.
+                self.folder_worker = FolderWorker(file_list)
+                self.folder_thread = QtCore.QThread()
+                self.folder_worker.moveToThread(self.folder_thread)
+                self.folder_thread.started.connect(self.folder_worker.process_files)
+                self.folder_worker.fileProcessed.connect(self.add_file_tab)
+                self.folder_worker.finished.connect(self.folder_thread.quit)
+                self.folder_worker.finished.connect(self.folder_worker.deleteLater)
+                self.folder_thread.finished.connect(self.folder_thread.deleteLater)
+                self.folder_thread.start()
+
+    @QtCore.pyqtSlot(str, bool, object, dict)
+    def add_file_tab(self, file_path, quality_flag=None, figure=None, details=None):
+        """
+        Create a new tab for the given audio file.
+        When called from the file dialog, we process the file immediately.
+        When called via signal from the folder worker, we already have the analysis results.
+        """
+        base_name = os.path.basename(file_path)
+        if quality_flag is None or figure is None or details is None:
+            # This branch is for single file processing.
+            try:
+                quality_flag, figure, details = analyze_audio(file_path)
+            except Exception as e:
+                error_widget = QtWidgets.QWidget()
+                layout = QtWidgets.QVBoxLayout(error_widget)
+                layout.addWidget(QtWidgets.QLabel(str(e)))
+                self.tab_widget.addTab(error_widget, base_name)
+                return
+
+        tab = SpectrogramTab(file_path, quality_flag, figure, details)
+        self.tab_widget.addTab(tab, base_name)
+        # Optionally, set the newly added tab as the current tab.
+        self.tab_widget.setCurrentWidget(tab)
+
+    def close_tab(self, index):
+        self.tab_widget.removeTab(index)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        for url in event.mimeData().urls():
+            file_path = url.toLocalFile()
+            if os.path.isdir(file_path):
+                for file in os.listdir(file_path):
+                    if file.lower().endswith(SUPPORTED_EXTENSIONS):
+                        self.add_file_tab(os.path.join(file_path, file))
+            elif file_path.lower().endswith(SUPPORTED_EXTENSIONS):
+                self.add_file_tab(file_path)
+
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()

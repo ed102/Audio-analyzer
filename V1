@@ -1,0 +1,180 @@
+import sys
+import os
+import numpy as np
+import librosa
+import librosa.display
+from PyQt5 import QtCore, QtGui, QtWidgets
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+
+# Define supported audio file extensions.
+SUPPORTED_EXTENSIONS = ('.mp3', '.wav', '.flac', '.alac', '.aiff', '.aif')
+
+# Threshold for high frequency energy ratio.
+HIGH_FREQ_THRESHOLD = 0.01  # This can be tweaked based on your listening tests
+
+def analyze_audio(file_path):
+    """
+    Loads an audio file, computes its spectrogram, and determines whether it has significant
+    high-frequency energy (above 16 kHz) for DJ-quality on high-end systems.
+
+    Returns:
+        quality_flag (bool): True if file is considered high quality.
+        fig (matplotlib.figure.Figure): Figure object with the spectrogram.
+        details (dict): Dictionary containing computed energy ratios and other details.
+    """
+    try:
+        # Load the audio file with its native sample rate.
+        y, sr = librosa.load(file_path, sr=None, mono=True)
+    except Exception as e:
+        raise Exception(f"Error loading {file_path}: {e}")
+
+    # Compute short-time Fourier transform (STFT)
+    D = np.abs(librosa.stft(y))
+    freqs = librosa.fft_frequencies(sr=sr)
+
+    # Find indices of frequencies above 16 kHz.
+    high_freq_idx = np.where(freqs >= 16000)[0]
+    if len(high_freq_idx) == 0:
+        # If sample rate is too low, then there are no frequencies above 16kHz.
+        high_energy_ratio = 0.0
+    else:
+        # Sum energy in the high frequencies and total energy.
+        high_energy = np.sum(D[high_freq_idx, :])
+        total_energy = np.sum(D)
+        high_energy_ratio = high_energy / total_energy if total_energy > 0 else 0.0
+
+    # Determine quality: if ratio is above our threshold, we mark it as high quality.
+    quality_flag = high_energy_ratio >= HIGH_FREQ_THRESHOLD
+
+    # Create a matplotlib figure for the spectrogram.
+    fig = Figure(figsize=(5, 3))
+    ax = fig.add_subplot(111)
+    img = librosa.display.specshow(librosa.amplitude_to_db(D, ref=np.max),
+                                   sr=sr, x_axis='time', y_axis='log', ax=ax,
+                                   cmap='viridis')
+    fig.colorbar(img, ax=ax, format="%+2.0f dB")
+    ax.set_title(os.path.basename(file_path))
+
+    details = {
+        'sample_rate': sr,
+        'high_energy_ratio': high_energy_ratio,
+        'threshold': HIGH_FREQ_THRESHOLD
+    }
+    return quality_flag, fig, details
+
+class SpectrogramTab(QtWidgets.QWidget):
+    """
+    Widget to display the spectrogram and quality information for a single audio file.
+    """
+    def __init__(self, file_path, parent=None):
+        super().__init__(parent)
+        self.file_path = file_path
+        self.layout = QtWidgets.QVBoxLayout(self)
+
+        try:
+            self.quality_flag, self.figure, self.details = analyze_audio(file_path)
+        except Exception as e:
+            error_label = QtWidgets.QLabel(str(e))
+            self.layout.addWidget(error_label)
+            return
+
+        # Create a canvas and add it to the layout.
+        self.canvas = FigureCanvas(self.figure)
+        self.layout.addWidget(self.canvas)
+
+        # Add a label for the quality flag.
+        quality_text = "High Quality" if self.quality_flag else "Low Quality"
+        quality_label = QtWidgets.QLabel(f"Quality: {quality_text}\nHigh Freq Energy Ratio: {self.details['high_energy_ratio']:.3f}")
+        quality_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.layout.addWidget(quality_label)
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("DJ Audio Quality Analyzer")
+        self.resize(800, 600)
+        self.central_widget = QtWidgets.QWidget(self)
+        self.setCentralWidget(self.central_widget)
+
+        # Main layout.
+        main_layout = QtWidgets.QVBoxLayout(self.central_widget)
+
+        # Buttons for loading file and folder.
+        button_layout = QtWidgets.QHBoxLayout()
+        self.load_file_btn = QtWidgets.QPushButton("Load File")
+        self.load_folder_btn = QtWidgets.QPushButton("Load Folder")
+        button_layout.addWidget(self.load_file_btn)
+        button_layout.addWidget(self.load_folder_btn)
+        main_layout.addLayout(button_layout)
+
+        # Tab widget for displaying files.
+        self.tab_widget = QtWidgets.QTabWidget()
+        main_layout.addWidget(self.tab_widget)
+
+        # Connect signals.
+        self.load_file_btn.clicked.connect(self.load_file)
+        self.load_folder_btn.clicked.connect(self.load_folder)
+
+        # Enable drag & drop.
+        self.setAcceptDrops(True)
+
+    def load_file(self):
+        """
+        Open a file dialog to choose a single audio file.
+        """
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select Audio File", "", 
+            "Audio Files (*.mp3 *.wav *.flac *.alac *.aiff *.aif)")
+        if file_path:
+            self.add_file_tab(file_path)
+
+    def load_folder(self):
+        """
+        Open a folder dialog to choose a directory. All supported audio files in the folder
+        will be added as separate tabs.
+        """
+        folder_path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Folder")
+        if folder_path:
+            for file in os.listdir(folder_path):
+                if file.lower().endswith(SUPPORTED_EXTENSIONS):
+                    full_path = os.path.join(folder_path, file)
+                    self.add_file_tab(full_path)
+
+    def add_file_tab(self, file_path):
+        """
+        Create a new tab for the given audio file.
+        """
+        tab = SpectrogramTab(file_path)
+        base_name = os.path.basename(file_path)
+        self.tab_widget.addTab(tab, base_name)
+
+    def dragEnterEvent(self, event):
+        """
+        Allow drag enter if it contains URLs (file paths).
+        """
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        """
+        Handle dropped files. Only supported audio files are added.
+        """
+        for url in event.mimeData().urls():
+            file_path = url.toLocalFile()
+            if os.path.isdir(file_path):
+                # If a folder is dropped, add all supported files in it.
+                for file in os.listdir(file_path):
+                    if file.lower().endswith(SUPPORTED_EXTENSIONS):
+                        self.add_file_tab(os.path.join(file_path, file))
+            elif file_path.lower().endswith(SUPPORTED_EXTENSIONS):
+                self.add_file_tab(file_path)
+
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()
